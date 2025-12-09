@@ -57,13 +57,23 @@ Key steps:
 
 ## 2. Baseline Methods
 
-The repository also includes implementations of the **baseline methods** used for comparison with STSLR-rDA:
+The repository also includes minimal PyTorch implementations of the **baseline methods** used for comparison with STSLR-rDA.  
+Each implementation is adapted/simplified from the authors’ original public code:
 
-- **DAN** – Deep Adaptation Network with MMD-based domain alignment.
-- **DGCNN** – Dynamic Graph Convolutional Neural Network operating on EEG time series.
-- **UDDA** – Unsupervised DDA for EEG emotion recognition, focusing on both global and local domain discrepancies to enhance feature discriminatingly.
-- **GRU-MCC** – GRU-based encoder with **Minimum Class Confusion (MCC)** loss for domain adaptation.
-- **SBLECA** – Sparse Bayesian learning on log-SPD covariance features with CORAL-based alignment.
+- **DAN** – Deep Adaptation Network with MMD-based domain alignment  
+  Original implementation: [https://github.com/MaterialsInformaticsDemo/DAN](https://github.com/MaterialsInformaticsDemo/DAN)
+
+- **DGCNN** – Dynamic Graph Convolutional Neural Network operating on EEG time series  
+  Original implementation: [https://github.com/zzx-JLU/DGCNN](https://github.com/zzx-JLU/DGCNN)
+
+- **UDDA** – Unsupervised domain adaptation method for EEG-based emotion recognition, combining global and local distribution alignment  
+  Original implementation: [https://github.com/JCJournal-Club/DDA](https://github.com/JCJournal-Club/DDA)
+
+- **GRU-MCC** – GRU-based encoder with **Minimum Class Confusion (MCC)** loss for domain adaptation  
+  Original implementation: [https://github.com/Heng-Cui/GRU-MCC](https://github.com/Heng-Cui/GRU-MCC)
+
+- **SBLECA** – Sparse Bayesian learning on log-SPD covariance features with CORAL-based alignment  
+  Original implementation: [https://github.com/EEGdecoding/Code-SBLECA](https://github.com/EEGdecoding/Code-SBLECA)
 
 These baselines are organized under:
 
@@ -74,3 +84,4 @@ baselines/
   UDDA.py
   GRU-MCC.py
   SBLECA.py
+
