@@ -3,7 +3,7 @@
 This repository contains the Python implementation of **STSLR-rDA** and the **baseline methods** used for comparison in our experiments on EEG-based emotion recognition.
 
 > **Note:** This code is provided for **reproducibility and inspection**.  
-> The EEG datasets used in the paper are **not included** due to license and size constraints (see [Data](#data) below).
+> The EEG datasets used in the paper are **not included** due to license and size constraints (see https://bcmi.sjtu.edu.cn/home/seed/).
 
 ---
 
