@@ -21,14 +21,14 @@ Key steps:
 
 ### Main files
 
-- `main_stslr_rda.py`  
+- `STSLR-rDA_main.py`  
   Minimal entry point showing how to:
   - load or simulate data with shape `(N, T, C)`  
     - `N`: number of trials  
     - `T`: number of time samples per trial  
     - `C`: number of EEG channels  
   - call the domain alignment pipeline  
-  - train the STSLR classifier and evaluate test accuracy.
+  - train the STSLR model and evaluate test accuracy.
 
 - `domain_align.py`  
   Core domain-alignment and feature extraction components:
@@ -41,9 +41,9 @@ Key steps:
     Rs_train, Rs_test = domain_align(X_train, X_test, tau_delay=1, ...)
     ```
     where `X_train` and `X_test` are raw time-series arrays of shape `(N, T, C)`,  
-    and `Rs_train`, `Rs_test` are log-SPD matrices of shape `(N, M, M)` used by the classifier.
+    and `Rs_train`, `Rs_test` are log-SPD matrices of shape `(N, M, M)` used by the model.
 
-- `log_l21_l1.py`  
+- `log_L21_L1.py`  
   Sparse spatio-temporal logistic regression:
   - `train_LogL21_L1(...)`: APGM solver for logistic regression with combined L1 + L21 regularization on a weight matrix `W ∈ ℝ^{M×M}`.
   - `Class_L21L1`: convenient wrapper with a scikit-learn–like interface:
@@ -61,16 +61,16 @@ The repository also includes implementations of the **baseline methods** used fo
 
 - **DAN** – Deep Adaptation Network with MMD-based domain alignment.
 - **DGCNN** – Dynamic Graph Convolutional Neural Network operating on EEG time series.
-- **UDDA** – Unified Deep Domain Adaptation framework (e.g., using GDD + LSD style discrepancies).
+- **UDDA** – Unsupervised DDA for EEG emotion recognition, focusing on both global and local domain discrepancies to enhance feature discriminatingly.
 - **GRU-MCC** – GRU-based encoder with **Minimum Class Confusion (MCC)** loss for domain adaptation.
-- **SBLECA / SBLEST-CORAL** – Sparse Bayesian learning on log-SPD covariance features with CORAL-based alignment.
+- **SBLECA** – Sparse Bayesian learning on log-SPD covariance features with CORAL-based alignment.
 
 These baselines are organized under:
 
 ```text
 baselines/
-  dan.py
-  dgcnn.py
-  udda.py
-  gru_mcc.py
-  sbleca.py
+  DAN.py
+  DGCNN.py
+  UDDA.py
+  GRU-MCC.py
+  SBLECA.py
