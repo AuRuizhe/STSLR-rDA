@@ -1,9 +1,13 @@
 # Sparse Spatio-Temporal Logistic Regression with Regularized Domain Alignment (STSLR-rDA)
 
+**Authors:** Ruizhe Hou, Wenlong Wang, Shi Dong, Feifei Qi, Tianyou Yu, Ke Liu, Jun Zhang, Zhenghui Gu, Zhuliang Yu.
+**Status:** Manuscript currently under review (submitted, 2025)
+
 This repository contains the Python implementation of **STSLR-rDA** and the **baseline methods** used for comparison in our experiments on EEG-based emotion recognition.
 
 > **Note:** This code is provided for **reproducibility and inspection**.  
 > The EEG datasets used in the paper are **not included** due to license and size constraints (see https://bcmi.sjtu.edu.cn/home/seed/).
+
 
 ---
 
