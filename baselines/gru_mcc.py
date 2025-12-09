@@ -1,1 +1,0 @@
-# GRU-MCC baseline implementation
