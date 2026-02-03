@@ -73,7 +73,7 @@ Each implementation is adapted/simplified from the authors’ original public co
 - **DGCNN** – Dynamic Graph Convolutional Neural Network operating on EEG time series  
   Original implementation: [https://github.com/zzx-JLU/DGCNN](https://github.com/zzx-JLU/DGCNN)
 
-  - **EmT (Emotion Transformer)** – A graph-transformer architecture for generalized cross-subject EEG emotion recognition. EmT represents EEG segments as temporal graphs, uses a residual multi-view pyramid GCN module to learn dynamic graph representations, and a temporal contextual transformer (TCT) to capture long-range temporal dependencies across feature graphs.  
+- **EmT (Emotion Transformer)** – A graph-transformer architecture for generalized cross-subject EEG emotion recognition. EmT represents EEG segments as temporal graphs, uses a residual multi-view pyramid GCN module to learn dynamic graph representations, and a temporal contextual transformer (TCT) to capture long-range temporal dependencies across feature graphs.  
   Original implementation: [https://github.com/yi-ding-cs/EmT](https://github.com/yi-ding-cs/EmT)
 
 - **UDDA** – Unsupervised domain adaptation method for EEG-based emotion recognition, combining global and local distribution alignment  
