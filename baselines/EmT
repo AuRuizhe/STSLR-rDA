@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""EmT for SEED-style .mat splits with raw EEG shaped (N, T, C)."""
+
+
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import random
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import scipy.io as sio
+from scipy.signal import welch
+from scipy.integrate import simpson as simps
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import weight_norm
+from torch.utils.data import Dataset, DataLoader
+
+from einops import rearrange
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+
+# --------------------------
+# Reproducibility helpers
+# --------------------------
+
+def seed_all(seed: int = 2022) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def set_gpu(gpu: str) -> None:
+    """Select a single GPU by id (string), e.g. "0"."""
+    torch.set_num_threads(1)
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+    print(f"using gpu: {gpu}")
+
+
+# --------------------------
+# Data shape utilities
+# --------------------------
+
+def ensure_NTC(X: np.ndarray, num_chan: int = 62, expected_time: Optional[int] = 1000) -> np.ndarray:
+    """Try to convert X to shape (N, T, C).
+
+    Many .mat exports may be (N,C,T) or (C,T,N). We test permutations and pick
+    the one whose last dim == num_chan, and if expected_time is given, prefer
+    middle dim == expected_time.
+    """
+    X = np.asarray(X)
+    if X.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape {X.shape}")
+
+    perms = [
+        (0, 1, 2), (0, 2, 1),
+        (1, 0, 2), (1, 2, 0),
+        (2, 0, 1), (2, 1, 0),
+    ]
+
+    best = None
+    best_score = -1
+    for p in perms:
+        Xt = np.transpose(X, p)
+        if Xt.shape[2] != num_chan:
+            continue
+        score = 0
+        if expected_time is not None and Xt.shape[1] == expected_time:
+            score += 10
+        # Prefer larger N as first dim (heuristic)
+        score += int(np.log1p(Xt.shape[0]))
+        if score > best_score:
+            best = Xt
+            best_score = score
+
+    if best is None:
+        raise ValueError(
+            f"Cannot infer (N,T,C). Input shape={X.shape}, num_chan={num_chan}. "
+            "Please check your .mat array dimension order."
+        )
+    return best
+
+
+def remap_labels_to_0K(y: np.ndarray, all_labels: Optional[np.ndarray] = None) -> Tuple[np.ndarray, int, Dict[int, int]]:
+    """Remap arbitrary labels to 0..K-1.
+
+    If all_labels is provided, mapping is built from that union set.
+    Returns (y_new, num_classes, mapping).
+    """
+    y = np.asarray(y).reshape(-1)
+    if all_labels is None:
+        uniq = np.unique(y)
+    else:
+        uniq = np.unique(np.asarray(all_labels).reshape(-1))
+    uniq = np.sort(uniq)
+    mapping = {int(old): int(i) for i, old in enumerate(uniq)}
+    y_new = np.vectorize(lambda v: mapping[int(v)])(y).astype(np.int64)
+    return y_new, len(uniq), mapping
+
+
+# --------------------------
+# Feature extraction
+# --------------------------
+
+def bandpower(data: np.ndarray, fs: int, band_sequence: List[List[float]], nperseg: int, relative: bool = False) -> np.ndarray:
+    """Compute (relative) bandpower for each channel.
+
+    Args:
+        data: (chan, time)
+        fs: sampling rate
+        band_sequence: list of [low, high]
+        nperseg: Welch window length (in samples)
+        relative: if True, divide each band power by total power
+
+    Returns:
+        (chan, num_bands)
+    """
+    data = np.asarray(data)
+    if data.ndim != 2:
+        raise ValueError(f"bandpower expects (chan,time), got {data.shape}")
+
+    nperseg = int(nperseg)
+    nperseg = max(2, min(nperseg, data.shape[1]))
+
+    freqs, psd = welch(data, fs, nperseg=nperseg, axis=-1)
+    freq_res = freqs[1] - freqs[0]
+
+    band_powers = []
+    total_power = None
+    if relative:
+        # total integral across all frequencies
+        total_power = simps(psd, dx=freq_res, axis=-1, even='avg')
+        total_power = np.maximum(total_power, 1e-12)  # avoid divide-by-zero
+
+    for band in band_sequence:
+        low, high = band
+        idx_band = np.logical_and(freqs >= low, freqs <= high)
+        bp = simps(psd[:, idx_band], dx=freq_res, axis=-1, even='avg')
+        if relative:
+            bp = bp / total_power
+        band_powers.append(bp)
+
+    band_powers = np.stack(band_powers, axis=-1)  # (chan, num_bands)
+    return band_powers
+
+
+def sliding_windows(T: int, win_len: int, overlap: float) -> np.ndarray:
+    """Return start indices for sliding windows covering [0, T)."""
+    win_len = int(win_len)
+    if win_len <= 0:
+        raise ValueError("win_len must be positive")
+    step = int(round(win_len * (1.0 - float(overlap))))
+    step = max(1, step)
+    if T < win_len:
+        return np.array([0], dtype=np.int64)
+    starts = np.arange(0, T - win_len + 1, step, dtype=np.int64)
+    if len(starts) == 0:
+        starts = np.array([0], dtype=np.int64)
+    return starts
+
+
+def extract_features(
+    X_ntc: np.ndarray,
+    fs: int,
+    win_len: int,
+    overlap: float,
+    bands: List[List[float]],
+    feature: str = "rPSD",
+    welch_nperseg: Optional[int] = None,
+    verbose: bool = True,
+) -> np.ndarray:
+    """Convert X from (N,T,C) to (N,S,C,F) for EmT.
+
+    feature:
+      - "rPSD": relative bandpower in each band -> F=len(bands)
+      - "PSD":  absolute bandpower -> F=len(bands)
+      - "raw":  use raw signal amplitude per window with F=win_len, S=1 (NOT recommended, but for quick debug)
+    """
+    X_ntc = np.asarray(X_ntc)
+    if X_ntc.ndim != 3:
+        raise ValueError(f"Expected (N,T,C), got {X_ntc.shape}")
+    N, T, C = X_ntc.shape
+
+    if feature.lower() == "raw":
+        # Use a single token (S=1), feature dimension is the whole time series length.
+        # We keep (N,1,C,T)
+        return X_ntc.transpose(0, 2, 1)[:, None, :, :].astype(np.float32)
+
+    starts = sliding_windows(T, win_len=win_len, overlap=overlap)
+    S = len(starts)
+    Fdim = len(bands)
+    out = np.empty((N, S, C, Fdim), dtype=np.float32)
+
+    if welch_nperseg is None:
+        welch_nperseg = min(fs, win_len)  # 1 second or the window itself
+
+    if verbose:
+        print(f"  Extracting {feature} features: N={N}, T={T}, C={C}, win_len={win_len}, overlap={overlap}, S={S}, F={Fdim}")
+
+    relative = feature.lower() == "rpsd"
+
+    for i in range(N):
+        if verbose and (i % max(1, N // 5) == 0):
+            print(f"    feature progress: {i}/{N}")
+        xi = X_ntc[i]  # (T,C)
+        for j, st in enumerate(starts):
+            seg = xi[st:st + win_len, :]  # (win_len,C)
+            bp = bandpower(seg.T, fs=fs, band_sequence=bands, nperseg=welch_nperseg, relative=relative)
+            out[i, j] = bp.astype(np.float32)
+
+    return out
+
+
+def standardize_channel_feature(train: np.ndarray, test: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
+    """Standardize per (channel, feature) using train statistics.
+
+    train/test: (N,S,C,F)
+    """
+    train = np.asarray(train, dtype=np.float32)
+    test = np.asarray(test, dtype=np.float32)
+    if train.ndim != 4:
+        raise ValueError(f"Expected train (N,S,C,F), got {train.shape}")
+
+    # flatten N and S -> (-1, C, F)
+    tr = train.reshape(-1, train.shape[2], train.shape[3])
+    te = test.reshape(-1, test.shape[2], test.shape[3])
+
+    mean = tr.mean(axis=0, keepdims=True)
+    std = tr.std(axis=0, keepdims=True)
+    std = np.maximum(std, eps)
+
+    tr = (tr - mean) / std
+    te = (te - mean) / std
+
+    return tr.reshape(train.shape), te.reshape(test.shape)
+
+
+# --------------------------
+# Dataset / metrics
+# --------------------------
+
+class EEGDataset(Dataset):
+    def __init__(self, x: torch.Tensor, y: torch.Tensor):
+        assert x.size(0) == y.size(0)
+        self.x = x
+        self.y = y
+
+    def __len__(self) -> int:
+        return self.y.size(0)
+
+    def __getitem__(self, idx: int):
+        return self.x[idx], self.y[idx]
+
+
+def compute_metrics(y_true: List[int], y_pred: List[int], num_classes: int) -> Tuple[float, float, np.ndarray]:
+    acc = accuracy_score(y_true, y_pred)
+    if num_classes == 2:
+        f1 = f1_score(y_true, y_pred)
+    else:
+        f1 = f1_score(y_true, y_pred, average='macro')
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    return acc, f1, cm
+
+
+def split_balance_class(
+    data: torch.Tensor,
+    label: torch.Tensor,
+    train_rate: float = 0.8,
+    seed: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Balanced train/val split (per class).
+
+    data: (N, ...)
+    label: (N,)
+    """
+    y = label.cpu().numpy()
+    rng = np.random.RandomState(seed)
+
+    idx_train: List[int] = []
+    idx_val: List[int] = []
+
+    classes = np.unique(y)
+    for c in classes:
+        idx = np.where(y == c)[0]
+        rng.shuffle(idx)
+        if len(idx) == 1:
+            # only 1 sample in this class, put it into train
+            idx_train.extend(idx.tolist())
+            continue
+        n_tr = int(round(len(idx) * train_rate))
+        n_tr = max(1, min(n_tr, len(idx) - 1))
+        idx_train.extend(idx[:n_tr].tolist())
+        idx_val.extend(idx[n_tr:].tolist())
+
+    if len(idx_val) == 0:
+        # fallback: random split 90/10
+        all_idx = np.arange(len(y))
+        rng.shuffle(all_idx)
+        # ensure val is not empty whenever possible
+        if len(y) <= 1:
+            n_tr = 1
+        else:
+            n_tr = int(round(len(y) * train_rate))
+            n_tr = max(1, min(n_tr, len(y) - 1))
+        idx_train = all_idx[:n_tr].tolist()
+        idx_val = all_idx[n_tr:].tolist()
+
+    # if still empty (e.g. total samples == 1), use train itself as val to avoid crash
+    if len(idx_val) == 0:
+        idx_val = idx_train.copy()
+
+    x_tr = data[idx_train]
+    y_tr = label[idx_train]
+    x_va = data[idx_val]
+    y_va = label[idx_val]
+    return x_tr, y_tr, x_va, y_va
+
+
+class LabelSmoothing(nn.Module):
+    """Cross-entropy with label smoothing."""
+
+    def __init__(self, smoothing: float = 0.1):
+        super().__init__()
+        self.smoothing = float(smoothing)
+        self.confidence = 1.0 - self.smoothing
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logprobs = F.log_softmax(x, dim=-1)
+        nll = -logprobs.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
+        smooth = -logprobs.mean(dim=-1)
+        loss = self.confidence * nll + self.smoothing * smooth
+        return loss.mean()
+
+# --------------------------
+# Model: EmT (from yi-ding-cs/EmT)
+# --------------------------
+
+class GCN(nn.Module):
+    """Simple GCN layer (similar to Kipf & Welling)."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / np.sqrt(self.weight.size(1))
+        with torch.no_grad():
+            self.weight.uniform_(-stdv, stdv)
+            if self.bias is not None:
+                self.bias.uniform_(-stdv, stdv)
+
+    @staticmethod
+    def norm_adj(adj: torch.Tensor) -> torch.Tensor:
+        # adj: (N,N)
+        rowsum = torch.sum(adj, dim=-1)  # (N,)
+        mask = (rowsum == 0).float()
+        rowsum = rowsum + mask
+        d_inv_sqrt = torch.pow(rowsum, -0.5)
+        d_mat_inv_sqrt = torch.diag_embed(d_inv_sqrt)
+        return d_mat_inv_sqrt @ adj @ d_mat_inv_sqrt
+
+    def forward(self, data):
+        graph, adj = data  # graph:(b, node, fin), adj:(node,node)
+        adj = self.norm_adj(adj)
+        support = graph @ self.weight
+        out = adj @ support
+        if self.bias is not None:
+            out = F.relu(out + self.bias)
+        else:
+            out = F.relu(out)
+        return out, adj
+
+
+class ChebyNet(nn.Module):
+    def __init__(self, K: int, in_feature: int, out_feature: int):
+        super().__init__()
+        self.K = int(K)
+        self.filter_weight = nn.Parameter(torch.empty(self.K, 1, in_feature, out_feature))
+        nn.init.normal_(self.filter_weight, 0, 0.1)
+        self.filter_bias = nn.Parameter(torch.zeros((1, 1, out_feature), dtype=torch.float32))
+        nn.init.normal_(self.filter_bias, 0, 0.1)
+
+    @staticmethod
+    def get_L(adj: torch.Tensor) -> torch.Tensor:
+        # adj: (node,node)
+        degree = torch.sum(adj, dim=1)
+        degree_norm = torch.div(1.0, torch.sqrt(degree) + 1.0e-5)
+        degree_matrix = torch.diag(degree_norm)
+        L = - degree_matrix @ adj @ degree_matrix
+        return L
+
+    def chebyshev(self, x: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
+        # x: (b, node, fin)
+        x1 = L @ x
+        x_ = torch.stack((x, x1), dim=1)  # (b, 2, node, fin)
+        if self.K > 2:
+            for _k in range(2, self.K):
+                x_current = 2 * (L @ x_[:, -1]) - x_[:, -2]
+                x_ = torch.cat((x_, x_current.unsqueeze(1)), dim=1)
+
+        # (b, K, node, fin) -> (K, b, node, fin)
+        x_ = x_.permute(1, 0, 2, 3)
+        out = torch.matmul(x_, self.filter_weight)  # (K, b, node, fout)
+        out = torch.sum(out, dim=0)  # (b, node, fout)
+        out = F.relu(out + self.filter_bias)
+        return out
+
+    def forward(self, data):
+        x, adj = data
+        L = self.get_L(adj)
+        out = self.chebyshev(x, L)
+        return out, adj
+
+
+class GraphEncoder(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        num_node: int,
+        in_features: int,
+        out_features: int,
+        K: int,
+        graph2token: str = 'Linear',
+        encoder_type: str = 'Cheby',
+    ):
+        super().__init__()
+        self.graph2token = graph2token
+        self.K = K
+        assert graph2token in ['Linear', 'AvgPool', 'MaxPool', 'Flatten']
+        assert encoder_type in ['Cheby', 'GCN']
+
+        if graph2token == 'Linear':
+            self.tokenizer = nn.Linear(num_node * out_features, out_features)
+        else:
+            self.tokenizer = None
+
+        layers = []
+        for i in range(int(num_layers)):
+            fin = in_features if i == 0 else out_features
+            if encoder_type == 'GCN':
+                layers.append(GCN(fin, out_features))
+            else:
+                layers.append(ChebyNet(K, fin, out_features))
+        self.encoder = nn.ModuleList(layers)
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # x: (b, node, fin), adj: (node,node)
+        for layer in self.encoder:
+            x, _ = layer((x, adj))
+
+        if self.tokenizer is not None:
+            x = x.reshape(x.size(0), -1)
+            return self.tokenizer(x)
+
+        if self.graph2token == 'AvgPool':
+            return torch.mean(x, dim=-1)
+        if self.graph2token == 'MaxPool':
+            return torch.max(x, dim=-1)[0]
+        # Flatten
+        return x.reshape(x.size(0), -1)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim: int, fn: nn.Module):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self.fn(self.norm(x), **kwargs)
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        anchor: int = 3,
+        dropout: float = 0.0,
+        alpha: float = 0.25,
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+
+        self.STA = nn.Sequential(
+            nn.Dropout(alpha * dropout),
+            weight_norm(
+                nn.Conv2d(
+                    self.heads,
+                    self.heads,
+                    (anchor, 1),
+                    stride=1,
+                    padding=(int(0.5 * (anchor - 1)), 0),
+                )
+            ),
+        )
+
+        self.to_out = (
+            nn.Sequential(
+                nn.Linear(inner_dim, dim),
+                nn.Dropout(dropout),
+            )
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (b, n, dim)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(dots)
+
+        out = torch.matmul(attn, v)  # (b,h,n,d)
+        out = self.STA(out)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class TTransformer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        alpha: float = 0.25,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(int(depth)):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PreNorm(dim, Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout, alpha=alpha)),
+                        PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout)),
+                    ]
+                )
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+        return x
+
+
+class EmT(nn.Module):
+    def __init__(
+        self,
+        layers_graph: List[int] = [1, 2],
+        layers_transformer: int = 8,
+        num_adj: int = 2,
+        num_chan: int = 62,
+        num_feature: int = 7,
+        hidden_graph: int = 32,
+        K: int = 4,
+        num_head: int = 16,
+        dim_head: int = 32,
+        dropout: float = 0.25,
+        num_class: int = 2,
+        alpha: float = 0.25,
+        graph2token: str = 'Linear',
+        encoder_type: str = 'Cheby',
+    ):
+        super().__init__()
+        self.graph_encoder_type = encoder_type
+
+        self.GE1 = GraphEncoder(
+            num_layers=layers_graph[0],
+            num_node=num_chan,
+            in_features=num_feature,
+            out_features=hidden_graph,
+            K=K,
+            graph2token=graph2token,
+            encoder_type=encoder_type,
+        )
+        self.GE2 = GraphEncoder(
+            num_layers=layers_graph[1],
+            num_node=num_chan,
+            in_features=num_feature,
+            out_features=hidden_graph,
+            K=K,
+            graph2token=graph2token,
+            encoder_type=encoder_type,
+        )
+
+        self.adjs = nn.Parameter(torch.empty(num_adj, num_chan, num_chan), requires_grad=True)
+        nn.init.xavier_uniform_(self.adjs)
+
+        # graph2token affects hidden_graph size
+        hg = hidden_graph
+        if graph2token in ['AvgPool', 'MaxPool']:
+            hg = num_chan
+        if graph2token == 'Flatten':
+            hg = num_chan * hidden_graph
+
+        self.transformer = TTransformer(
+            depth=layers_transformer,
+            dim=hg,
+            heads=num_head,
+            dim_head=dim_head,
+            dropout=dropout,
+            mlp_dim=dim_head,
+            alpha=alpha,
+        )
+
+        self.to_GNN_out = nn.Linear(num_chan * num_feature, hg, bias=False)
+
+        self.MLP = nn.Linear(hg, num_class)
+
+    def get_adj(self, self_loop: bool = True) -> torch.Tensor:
+        num_nodes = self.adjs.shape[-1]
+        adj = F.relu(self.adjs + self.adjs.transpose(2, 1))
+        if self_loop:
+            eye = torch.eye(num_nodes, device=self.adjs.device)
+            adj = adj + eye
+        return adj
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq, chan, feature)
+        b, s, chan, f = x.size()
+        x = rearrange(x, 'b s c f -> (b s) c f')
+
+        if self.graph_encoder_type == 'Cheby':
+            adjs = self.get_adj(self_loop=False)
+        else:
+            adjs = self.get_adj(self_loop=True)
+
+        # multi-view pyramid residual GNN block
+        x_ = x.reshape(x.size(0), -1)
+        x_ = self.to_GNN_out(x_)
+        x1 = self.GE1(x, adjs[0])
+        x2 = self.GE2(x, adjs[1])
+        x = torch.stack((x_, x1, x2), dim=1)
+        x = torch.mean(x, dim=1)
+
+        # temporal transformer
+        x = rearrange(x, '(b s) h -> b s h', b=b, s=s)
+        x = self.transformer(x)
+        x = torch.mean(x, dim=-2)
+        x = self.MLP(x)
+        return x
+
+
+# --------------------------
+# Train / Eval loops
+# --------------------------
+
+def make_loader(x: torch.Tensor, y: torch.Tensor, batch_size: int, shuffle: bool, num_workers: int = 0) -> DataLoader:
+    ds = EEGDataset(x, y)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    device: torch.device,
+) -> Tuple[float, List[int], List[int]]:
+    is_train = optimizer is not None
+    model.train(is_train)
+
+    total_loss = 0.0
+    n_samples = 0
+    preds: List[int] = []
+    acts: List[int] = []
+
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+
+        # 如果 batch_size==1 某些实现可能不稳定，这里沿用原仓库的防御式写法
+        if xb.size(0) == 1 and is_train:
+            xb = torch.cat([xb, xb], dim=0)
+            yb = torch.cat([yb, yb], dim=0)
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+
+        out = model(xb)
+        loss = criterion(out, yb)
+
+        if is_train:
+            loss.backward()
+            optimizer.step()
+
+        bs = yb.size(0)
+        total_loss += loss.item() * bs
+        n_samples += bs
+
+        pred = torch.argmax(out, dim=1)
+        preds.extend(pred.detach().cpu().tolist())
+        acts.extend(yb.detach().cpu().tolist())
+
+    avg_loss = total_loss / max(1, n_samples)
+    return avg_loss, preds, acts
+
+
+def train_one_subject(
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+    num_classes: int,
+    args: argparse.Namespace,
+) -> Tuple[float, float, float, float]:
+    """Train on one subject split. Returns (best_val_acc, best_val_f1, test_acc, test_f1)."""
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # numpy -> torch
+    xtr = torch.from_numpy(x_train).float()
+    ytr = torch.from_numpy(y_train).long()
+    xte = torch.from_numpy(x_test).float()
+    yte = torch.from_numpy(y_test).long()
+
+    # train/val split
+    x_tr, y_tr, x_va, y_va = split_balance_class(xtr, ytr, train_rate=args.train_rate, seed=args.random_seed)
+
+    train_loader = make_loader(x_tr, y_tr, batch_size=args.batch_size, shuffle=True)
+    val_loader = make_loader(x_va, y_va, batch_size=min(256, max(1, len(y_va))), shuffle=False)
+    test_loader = make_loader(xte, yte, batch_size=min(256, max(1, len(yte))), shuffle=False)
+
+    model = EmT(
+        layers_graph=args.layers_graph,
+        layers_transformer=args.layers_transformer,
+        num_adj=args.num_adj,
+        num_chan=args.num_channel,
+        num_feature=args.num_feature,
+        hidden_graph=args.hidden_graph,
+        K=args.K,
+        num_head=args.num_head,
+        dim_head=args.dim_head,
+        dropout=args.dropout,
+        num_class=num_classes,
+        alpha=args.alpha,
+        graph2token=args.graph2token,
+        encoder_type=args.encoder_type,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    if args.label_smoothing > 0:
+        criterion = LabelSmoothing(args.label_smoothing)
+    else:
+        criterion = nn.CrossEntropyLoss()
+
+    best_val_acc = -1.0
+    best_val_f1 = -1.0
+    best_state = None
+    patience = int(args.patience)
+    bad_epochs = 0
+
+    for epoch in range(1, args.max_epoch + 1):
+        tr_loss, tr_pred, tr_act = run_epoch(model, train_loader, criterion, optimizer, device)
+        tr_acc, tr_f1, _ = compute_metrics(tr_act, tr_pred, num_classes)
+
+        va_loss, va_pred, va_act = run_epoch(model, val_loader, criterion, None, device)
+        va_acc, va_f1, _ = compute_metrics(va_act, va_pred, num_classes)
+
+        print(
+            f"    epoch {epoch:03d}/{args.max_epoch} | "
+            f"train loss {tr_loss:.4f} acc {tr_acc:.4f} f1 {tr_f1:.4f} | "
+            f"val loss {va_loss:.4f} acc {va_acc:.4f} f1 {va_f1:.4f}"
+        )
+
+        improved = va_acc > best_val_acc
+        if improved:
+            best_val_acc = va_acc
+            best_val_f1 = va_f1
+            best_state = copy.deepcopy(model.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if patience > 0 and bad_epochs >= patience:
+            print(f"    Early stop: no improvement in {patience} epochs")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    te_loss, te_pred, te_act = run_epoch(model, test_loader, nn.CrossEntropyLoss(), None, device)
+    te_acc, te_f1, cm = compute_metrics(te_act, te_pred, num_classes)
+    print(f"    >>> Test loss {te_loss:.4f} acc {te_acc:.4f} f1 {te_f1:.4f}")
+    if args.print_cm:
+        print("    Confusion matrix:\n", cm)
+
+    return best_val_acc, best_val_f1, te_acc, te_f1
+
+
+# --------------------------
+# Main
+# --------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+
+    # Data
+    parser.add_argument('--data_path', type=str, help='folder containing .mat files')
+    parser.add_argument('--mat_key_train', type=str, default='X_train')
+    parser.add_argument('--mat_key_test', type=str, default='X_test')
+    parser.add_argument('--mat_key_y_train', type=str, default='y_train')
+    parser.add_argument('--mat_key_y_test', type=str, default='y_test')
+
+    parser.add_argument('--num_channel', type=int, default=62)
+    parser.add_argument('--expected_time', type=int, default=800)
+
+    # Feature extraction
+    parser.add_argument('--feature', type=str, default='rPSD', choices=['rPSD', 'PSD', 'raw'])
+    parser.add_argument('--sampling_rate', type=int, default=200)
+    parser.add_argument('--win_len', type=int, default=400, help='window length in samples')
+    parser.add_argument('--overlap', type=float, default=0.75)
+    parser.add_argument('--welch_nperseg', type=int, default=200, help='nperseg for scipy.signal.welch')
+
+    # Training
+    parser.add_argument('--random_seed', type=int, default=2022)
+    parser.add_argument('--gpu', type=str, default='0')
+    parser.add_argument('--max_epoch', type=int, default=30)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--train_rate', type=float, default=0.8)
+    parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--print_cm', action='store_true')
+
+    # Model (EmT)
+    parser.add_argument('--layers_graph', type=int, nargs=2, default=[1, 2])
+    parser.add_argument('--layers_transformer', type=int, default=8)
+    parser.add_argument('--num_adj', type=int, default=2)
+    parser.add_argument('--hidden_graph', type=int, default=32)
+    parser.add_argument('--K', type=int, default=4)
+    parser.add_argument('--num_head', type=int, default=16)
+    parser.add_argument('--dim_head', type=int, default=32)
+    parser.add_argument('--dropout', type=float, default=0.25)
+    parser.add_argument('--alpha', type=float, default=0.25)
+    parser.add_argument('--graph2token', type=str, default='Linear', choices=['Linear', 'AvgPool', 'MaxPool', 'Flatten'])
+    parser.add_argument('--encoder_type', type=str, default='Cheby', choices=['GCN', 'Cheby'])
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if torch.cuda.is_available():
+        set_gpu(args.gpu)
+    seed_all(args.random_seed)
+
+    # 7-band setting (same spirit as original EmT code)
+    bands = [[1, 4], [4, 8], [8, 14], [14, 31], [31, 50]]
+
+    files = sorted([f for f in os.listdir(args.data_path) if f.endswith('.mat')])
+    if len(files) == 0:
+        raise FileNotFoundError(f"No .mat files found in: {args.data_path}")
+
+    accs: List[float] = []
+    f1s: List[float] = []
+
+    for k, fname in enumerate(files):
+        print(f"\n=== Subject {k}: {fname} ===")
+        mat = sio.loadmat(os.path.join(args.data_path, fname))
+
+        Xtr = mat[args.mat_key_train]
+        Xte = mat[args.mat_key_test]
+        ytr = mat[args.mat_key_y_train].ravel()
+        yte = mat[args.mat_key_y_test].ravel()
+
+        # shape fix
+        Xtr = ensure_NTC(Xtr, num_chan=args.num_channel, expected_time=args.expected_time)
+        Xte = ensure_NTC(Xte, num_chan=args.num_channel, expected_time=args.expected_time)
+
+        # label fix + remap
+        y_all = np.concatenate([ytr.reshape(-1), yte.reshape(-1)])
+        ytr_new, num_classes, mapping = remap_labels_to_0K(ytr, all_labels=y_all)
+        yte_new, _, _ = remap_labels_to_0K(yte, all_labels=y_all)
+        print(f"  Label mapping: {mapping} -> 0..{num_classes-1}")
+
+        # feature extraction
+        feat_tr = extract_features(
+            Xtr.astype(np.float32),
+            fs=args.sampling_rate,
+            win_len=args.win_len,
+            overlap=args.overlap,
+            bands=bands,
+            feature=args.feature,
+            welch_nperseg=args.welch_nperseg,
+            verbose=True,
+        )
+        feat_te = extract_features(
+            Xte.astype(np.float32),
+            fs=args.sampling_rate,
+            win_len=args.win_len,
+            overlap=args.overlap,
+            bands=bands,
+            feature=args.feature,
+            welch_nperseg=args.welch_nperseg,
+            verbose=False,
+        )
+
+        # update args.num_feature
+        if args.feature.lower() == 'raw':
+            args.num_feature = feat_tr.shape[-1]  # =T
+        else:
+            args.num_feature = feat_tr.shape[-1]  # =F
+
+        # normalize (channel, feature)
+        feat_tr, feat_te = standardize_channel_feature(feat_tr, feat_te)
+
+        # train / test
+        best_va_acc, best_va_f1, te_acc, te_f1 = train_one_subject(
+            feat_tr,
+            ytr_new.astype(np.int64),
+            feat_te,
+            yte_new.astype(np.int64),
+            num_classes,
+            args,
+        )
+
+        print(f"  Best Val acc {best_va_acc:.4f} f1 {best_va_f1:.4f} | Test acc {te_acc:.4f} f1 {te_f1:.4f}")
+        accs.append(te_acc)
+        f1s.append(te_f1)
+
+    # summary
+    acc_mean = float(np.mean(accs))
+    acc_std = float(np.std(accs))
+    f1_mean = float(np.mean(f1s))
+    f1_std = float(np.std(f1s))
+    print("\n==== Final Report ====")
+    print(f"Test mAcc = {acc_mean:.4f} ({acc_std:.4f}) ({accs})")
+    print(f"Test mF1  = {f1_mean:.4f} ({f1_std:.4f}) ({f1s})")
+
+
+if __name__ == '__main__':
+    main()
