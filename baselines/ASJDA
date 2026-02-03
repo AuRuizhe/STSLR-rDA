@@ -1,0 +1,866 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ASJDA for SEED-like .mat files with format:
+  X_train: (N, T, C)
+  y_train: (N,) or (N,1)
+  X_test:  (Nte, T, C)
+  y_test:  (Nte,) or (Nte,1)
+
+This script adapts the official ASJDA repo (Pam098/ASJDA) to your data format.
+
+Key adaptation:
+- Original ASJDA assumes DE features of shape (N, 310) where 310 = 62 channels * 5 bands.
+- Here we extract 5-band log-bandpower features (or DE-like) from raw EEG (T,C) to get 310-dim vectors.
+- Cross-subject setting:
+    * For target subject k: sources are other subjects' TRAIN sets (labeled).
+    * Target unlabeled adaptation uses target subject's TRAIN set (labels are ignored).
+    * Final evaluation is on target subject's TEST set.
+
+You can switch source selection strategy:
+  --source_select all | topk | threshold
+and control --top_k or --js_threshold.
+
+Example:
+  python run_asjda_seed_mat.py --data_path /home/.../Cross_data --gpu 0 --epochs 200 --batch_size 32
+
+Dependencies:
+  pip install numpy scipy scikit-learn torch
+
+Notes:
+- Feature extraction can be slow for large N. Use --cache_dir to cache features per subject.
+"""
+
+import argparse
+import copy
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import scipy.io as sio
+from scipy.signal import welch
+from scipy.stats import entropy
+from scipy.spatial.distance import jensenshannon
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+
+# -------------------------
+# Reproducibility utilities
+# -------------------------
+
+def setup_seed(seed: int = 20) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def get_device(gpu: str) -> torch.device:
+    if torch.cuda.is_available():
+        # respect CUDA_VISIBLE_DEVICES if user sets it externally
+        if gpu is not None and gpu != "":
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+# -------------------------
+# Data loading
+# -------------------------
+
+def _squeeze_label(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y)
+    if y.ndim == 2 and (y.shape[0] == 1 or y.shape[1] == 1):
+        y = y.reshape(-1)
+    return y
+
+
+def _ensure_NTC(X: np.ndarray, expected_C: int = 62) -> np.ndarray:
+    """
+    Make X become (N, T, C).
+    Accept common alternatives: (N, C, T) or (T, C, N) etc.
+    """
+    X = np.asarray(X)
+    if X.ndim != 3:
+        raise ValueError(f"Expected X to be 3D, got shape={X.shape}")
+
+    # already (N,T,C)
+    if X.shape[2] == expected_C:
+        return X
+
+    # (N,C,T)
+    if X.shape[1] == expected_C:
+        return np.transpose(X, (0, 2, 1))
+
+    # (T,C,N)
+    if X.shape[1] == expected_C:
+        return np.transpose(X, (2, 0, 1))
+
+    # (C,T,N)
+    if X.shape[0] == expected_C:
+        return np.transpose(X, (2, 1, 0))
+
+    raise ValueError(
+        f"Cannot infer (N,T,C). Got {X.shape}, expected C={expected_C} in one axis."
+    )
+
+
+def load_subject_mat(
+    filepath: str,
+    key_X_train: str = "X_train",
+    key_X_test: str = "X_test",
+    key_y_train: str = "y_train",
+    key_y_test: str = "y_test",
+    expected_C: int = 62,
+    replace_neg1_with_0: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    mat = sio.loadmat(filepath)
+    if key_X_train not in mat or key_X_test not in mat or key_y_train not in mat or key_y_test not in mat:
+        raise KeyError(
+            f"Missing keys in {filepath}. "
+            f"Need {key_X_train},{key_X_test},{key_y_train},{key_y_test}. "
+            f"Available keys: {list(mat.keys())}"
+        )
+
+    Xtr = _ensure_NTC(mat[key_X_train], expected_C=expected_C).astype(np.float32)
+    Xte = _ensure_NTC(mat[key_X_test], expected_C=expected_C).astype(np.float32)
+    ytr = _squeeze_label(mat[key_y_train]).astype(np.int64)
+    yte = _squeeze_label(mat[key_y_test]).astype(np.int64)
+
+    if replace_neg1_with_0:
+        ytr = ytr.copy()
+        yte = yte.copy()
+        ytr[ytr == -1] = 0
+        yte[yte == -1] = 0
+
+    return Xtr, ytr, Xte, yte
+
+
+def remap_labels_all_subjects(subjects):
+    all_y = np.concatenate([sub["y"] for sub in subjects], axis=0)
+    uniq = np.unique(all_y)
+    mapping = {int(v): i for i, v in enumerate(sorted([int(x) for x in uniq]))}
+
+    for sub in subjects:
+        sub["y"] = np.vectorize(mapping.get)(sub["y"]).astype(np.int64)
+
+    return subjects, mapping
+
+
+# -------------------------
+# Feature extraction: 62ch x 5band => 310 dims
+# -------------------------
+
+DEFAULT_BANDS_5 = [(1, 4), (4, 8), (8, 14), (14, 31), (31, 45)]  # common SEED bands
+
+
+def bandpower_features_one(
+    x_tc: np.ndarray,
+    fs: int,
+    bands: List[Tuple[float, float]],
+    nperseg: int,
+    relative: bool = False,
+    de_like: bool = True,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Compute (C, B) features from one sample x_tc: (T,C).
+
+    - Welch PSD per channel
+    - integrate PSD in each band
+    - if relative: divide each band's power by total power per channel
+    - if de_like: return 0.5*log(2*pi*e*power)  (DE for Gaussian assumption)
+      else: return log(power)
+    """
+    if x_tc.ndim != 2:
+        raise ValueError(f"x_tc must be 2D (T,C); got {x_tc.shape}")
+    T, C = x_tc.shape
+    nperseg_eff = int(min(nperseg, T))
+    if nperseg_eff < 8:
+        # Welch requires enough points; fall back to using full length
+        nperseg_eff = T
+
+    freqs, psd = welch(x_tc, fs=fs, nperseg=nperseg_eff, axis=0)  # psd: (F, C)
+
+    # total power for relative
+    if relative:
+        total = np.trapz(psd, freqs, axis=0)  # (C,)
+        total = np.maximum(total, eps)
+
+    feats = np.zeros((C, len(bands)), dtype=np.float32)
+    for bi, (low, high) in enumerate(bands):
+        idx = np.logical_and(freqs >= low, freqs <= high)
+        if not np.any(idx):
+            # if band out of PSD range
+            feats[:, bi] = 0.0
+            continue
+        bp = np.trapz(psd[idx, :], freqs[idx], axis=0)  # (C,)
+        bp = np.maximum(bp, eps)
+        if relative:
+            bp = bp / total
+            bp = np.maximum(bp, eps)
+
+        if de_like:
+            # DE = 0.5 * log(2*pi*e*var). Using bandpower as var proxy.
+            feats[:, bi] = (0.5 * np.log(2.0 * np.pi * np.e * bp)).astype(np.float32)
+        else:
+            feats[:, bi] = np.log(bp).astype(np.float32)
+
+    return feats  # (C,B)
+
+
+def extract_features_NTC(
+    X: np.ndarray,
+    fs: int,
+    bands: List[Tuple[float, float]],
+    nperseg: int,
+    relative: bool = False,
+    de_like: bool = True,
+    expected_C: int = 62,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    X: (N,T,C) -> features: (N, C*B)
+    """
+    X = _ensure_NTC(X, expected_C=expected_C)
+    N, T, C = X.shape
+    B = len(bands)
+    out = np.zeros((N, C * B), dtype=np.float32)
+    for i in range(N):
+        feats_cb = bandpower_features_one(
+            X[i], fs=fs, bands=bands, nperseg=nperseg, relative=relative, de_like=de_like
+        )  # (C,B)
+        out[i] = feats_cb.reshape(-1)  # channel-major flatten
+        if verbose and (i + 1) % 200 == 0:
+            print(f"  feature extract {i+1}/{N}")
+    return out
+
+
+def minmax_fit(X: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    mn = np.min(X, axis=0)
+    mx = np.max(X, axis=0)
+    rng = mx - mn
+    rng = np.where(rng < eps, 1.0, rng)
+    return mn, rng
+
+
+def minmax_transform(X: np.ndarray, mn: np.ndarray, rng: np.ndarray) -> np.ndarray:
+    return (X - mn) / rng
+
+
+# -------------------------
+# ASJDA components (cleaned, no exec/eval)
+# -------------------------
+
+class CFE(nn.Module):
+    def __init__(self, input_dim: int = 310):
+        super().__init__()
+        self.module = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.module(x)
+
+
+class DSFE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.module = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.module(x)
+
+
+def gaussian_kernel(source: torch.Tensor, target: torch.Tensor, kernel_mul=2.0, kernel_num=5, fix_sigma=None) -> torch.Tensor:
+    """
+    Gaussian kernel used by LSD. source: (n,d), target: (m,d)
+    """
+    n_samples = int(source.size(0)) + int(target.size(0))
+    total = torch.cat([source, target], dim=0)  # (n+m,d)
+
+    total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
+    total1 = total.unsqueeze(1).expand(total.size(0), total.size(0), total.size(1))
+    L2_distance = ((total0 - total1) ** 2).sum(2)
+
+    if fix_sigma is not None:
+        bandwidth = fix_sigma
+    else:
+        bandwidth = torch.sum(L2_distance.detach()) / (n_samples ** 2 - n_samples + 1e-12)
+    bandwidth = bandwidth / (kernel_mul ** (kernel_num // 2))
+    bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
+    kernel_val = [torch.exp(-L2_distance / (bw + 1e-12)) for bw in bandwidth_list]
+    return sum(kernel_val)
+
+
+def coefficient(category_1: int, category_2: int, sample1_label: torch.Tensor, sample2_label: torch.Tensor) -> torch.Tensor:
+    """
+    Build class indicator outer product used by LSD.
+    """
+    cls_bool1 = (sample1_label == category_1).view(-1, 1).int()
+    cls_bool2 = (sample2_label == category_2).view(-1, 1).int()
+    total_cls = torch.cat([cls_bool1, cls_bool2], dim=0).view(-1).int()  # (n+m,)
+    total_coef = torch.ger(total_cls, total_cls).to(sample1_label.device)  # (n+m, n+m)
+    return total_coef
+
+
+def lsd_loss(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    source_label: torch.Tensor,
+    target_label: torch.Tensor,
+    num_class: int,
+    kernel_mul=2.0,
+    kernel_num=5,
+    fix_sigma=None,
+) -> torch.Tensor:
+    """
+    Label-aware semi-supervised discrepancy (LSD) loss from the repo,
+    generalized to arbitrary num_class.
+
+    source: (n,d), target: (m,d)
+    labels: (n,), (m,)
+    """
+    n = int(source.size(0))
+    m = int(target.size(0))
+    if n < 2 or m < 2:
+        return torch.zeros((), device=source.device)
+
+    kernels = gaussian_kernel(source, target, kernel_mul=kernel_mul, kernel_num=kernel_num, fix_sigma=fix_sigma)
+    XX = kernels[:n, :n]
+    YY = kernels[n:, n:]
+    XY = kernels[:n, n:]
+    YX = kernels[n:, :n]
+
+    intra_vals = []
+    inter_vals = []
+
+    for c1 in range(num_class):
+        for c2 in range(num_class):
+            coef_val = coefficient(c1, c2, source_label, target_label)
+            e_ss = (coef_val[:n, :n] * XX) / (coef_val[:n, :n].sum() + 1e-5)
+            e_st = (coef_val[:n, n:] * XY) / (coef_val[:n, n:].sum() + 1e-5)
+            e_ts = (coef_val[n:, :n] * YX) / (coef_val[n:, :n].sum() + 1e-5)
+            e_tt = (coef_val[n:, n:] * YY) / (coef_val[n:, n:].sum() + 1e-5)
+
+            val = e_ss.sum() + e_tt.sum() - e_st.sum() - e_ts.sum()
+            if c1 == c2:
+                intra_vals.append(val)
+            else:
+                inter_vals.append(val)
+
+    if len(intra_vals) == 0 or len(inter_vals) == 0:
+        return torch.zeros((), device=source.device)
+
+    loss = sum(intra_vals) / len(intra_vals) - sum(inter_vals) / len(inter_vals)
+    return loss
+
+
+def mmd_linear(f_of_X: torch.Tensor, f_of_Y: torch.Tensor) -> torch.Tensor:
+    """
+    Linear MMD used by the repo. Requires f_of_X and f_of_Y with same shape.
+    """
+    delta = f_of_X - f_of_Y
+    loss = torch.mean(torch.mm(delta, delta.t()))
+    return loss
+
+
+class ASJDANet(nn.Module):
+    """
+    Multi-source ASJDA network.
+    """
+    def __init__(self, input_dim: int, number_of_source: int, number_of_category: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.number_of_source = number_of_source
+        self.number_of_category = number_of_category
+
+        self.sharedNet = CFE(input_dim=input_dim)
+        self.dsfe = nn.ModuleList([DSFE() for _ in range(number_of_source)])
+        self.cls = nn.ModuleList([nn.Linear(32, number_of_category) for _ in range(number_of_source)])
+
+    def forward(
+        self,
+        data_src: torch.Tensor,
+        number_of_source: int,
+        data_tgt: Optional[torch.Tensor] = None,
+        label_src: Optional[torch.Tensor] = None,
+        mark: int = 0,
+        num_class_for_lsd: Optional[int] = None,
+        confident_threshold: float = 0.60,
+    ):
+        if self.training:
+            assert data_tgt is not None and label_src is not None
+            if num_class_for_lsd is None:
+                num_class_for_lsd = self.number_of_category
+
+            # common feature extractor
+            data_src_CFE = self.sharedNet(data_src)
+            data_tgt_CFE = self.sharedNet(data_tgt)
+
+            # target DSFE features for all sources
+            data_tgt_DSFE = [self.dsfe[i](data_tgt_CFE) for i in range(number_of_source)]
+
+            # source DSFE for current mark
+            data_src_DSFE = self.dsfe[mark](data_src_CFE)
+
+            # mmd between source DSFE and target DSFE of same mark
+            mmd_loss_val = mmd_linear(data_src_DSFE, data_tgt_DSFE[mark])
+
+            # discrepancy loss across DSFEs (repo uses softmax over features; we keep that)
+            disc_loss_val = torch.zeros((), device=data_src.device)
+            for i in range(number_of_source):
+                if i != mark:
+                    disc_loss_val = disc_loss_val + torch.mean(
+                        torch.abs(
+                            F.softmax(data_tgt_DSFE[mark], dim=1) - F.softmax(data_tgt_DSFE[i], dim=1)
+                        )
+                    )
+
+            # classification loss on source
+            pred_src = self.cls[mark](data_src_DSFE)
+            cls_loss_val = F.nll_loss(F.log_softmax(pred_src, dim=1), label_src.view(-1))
+
+            # pseudo-label confidence mask (repo uses source pred to filter target features)
+            prob_src = F.softmax(pred_src, dim=1)
+            max_prob, pseudo_label = torch.max(prob_src, dim=1)
+            confident_bool = max_prob >= confident_threshold
+            confident_example = data_tgt_DSFE[mark][confident_bool]
+            confident_label = pseudo_label[confident_bool]
+
+            if confident_example.size(0) < 2:
+                lsd_loss_val = torch.zeros((), device=data_src.device)
+            else:
+                lsd_loss_val = lsd_loss(
+                    source=data_src_DSFE,
+                    target=confident_example,
+                    source_label=label_src.view(-1),
+                    target_label=confident_label.view(-1),
+                    num_class=num_class_for_lsd,
+                )
+
+            return cls_loss_val, mmd_loss_val, disc_loss_val, lsd_loss_val
+
+        # eval: ensemble predictions from each source-specific head
+        data_CFE = self.sharedNet(data_src)
+        preds = []
+        for i in range(number_of_source):
+            feat = self.dsfe[i](data_CFE)
+            preds.append(self.cls[i](feat))
+        return preds
+
+
+# -------------------------
+# Datasets / Loaders
+# -------------------------
+
+class FeatureDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(np.asarray(X, dtype=np.float32))
+        self.y = torch.from_numpy(np.asarray(y, dtype=np.int64))
+
+        if self.X.ndim != 2:
+            raise ValueError(f"FeatureDataset expects X 2D (N,D), got {self.X.shape}")
+        if self.y.ndim != 1:
+            self.y = self.y.view(-1)
+        assert self.X.size(0) == self.y.size(0), f"X and y length mismatch: {self.X.size(0)} vs {self.y.size(0)}"
+
+    def __len__(self) -> int:
+        return int(self.y.size(0))
+
+    def __getitem__(self, idx: int):
+        return self.X[idx], self.y[idx]
+
+
+def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool, drop_last: bool, num_workers: int = 0) -> DataLoader:
+    ds = FeatureDataset(X, y)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, num_workers=num_workers, pin_memory=True)
+
+
+# -------------------------
+# Source selection (adaptive)
+# -------------------------
+
+def js_divergence_between_domains(source_feat: np.ndarray, target_feat: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Follow repo spirit:
+      source_pdf = entropy(source_data, axis=0)
+      target_pdf = entropy(target_data, axis=0)
+      js = jensenshannon(source_pdf, target_pdf)
+    We additionally normalize to sum=1 to make JS well-defined.
+    """
+    source_pdf = entropy(source_feat + eps, base=np.e, axis=0)
+    target_pdf = entropy(target_feat + eps, base=np.e, axis=0)
+    source_pdf = np.asarray(source_pdf, dtype=np.float64) + eps
+    target_pdf = np.asarray(target_pdf, dtype=np.float64) + eps
+    source_pdf = source_pdf / np.sum(source_pdf)
+    target_pdf = target_pdf / np.sum(target_pdf)
+    return float(jensenshannon(source_pdf, target_pdf))
+
+
+def select_source_subjects(
+    js_scores: Dict[int, float],
+    mode: str,
+    top_k: int,
+    threshold: float,
+) -> List[int]:
+    """
+    js_scores: {subject_idx: js_value}, only for candidate sources (excluding target).
+    """
+    items = sorted(js_scores.items(), key=lambda x: x[1])  # ascending
+    if mode == "all":
+        return [k for k, _ in items]
+    if mode == "topk":
+        return [k for k, _ in items[:max(1, top_k)]]
+    if mode == "threshold":
+        selected = [k for k, v in items if v < threshold]
+        if len(selected) == 0:
+            selected = [k for k, _ in items[:max(1, top_k)]]
+        return selected
+    raise ValueError(f"Unknown source_select mode: {mode}")
+
+
+# -------------------------
+# Training / evaluation
+# -------------------------
+
+@torch.no_grad()
+def evaluate(model: ASJDANet, loader: DataLoader, num_sources: int, device: torch.device) -> Tuple[int, int]:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True).view(-1)
+        preds_list = model(x, num_sources)  # list of logits
+        probs = [F.softmax(p, dim=1) for p in preds_list]
+        avg = sum(probs) / len(probs)
+        pred = torch.argmax(avg, dim=1)
+        correct += int((pred == y).sum().item())
+        total += int(y.numel())
+    return correct, total
+
+
+def train_asjda_for_target(
+    source_loaders: List[DataLoader],
+    target_train_loader: DataLoader,
+    target_test_loader: DataLoader,
+    input_dim: int,
+    num_classes: int,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    eval_interval: int,
+    log_interval: int,
+    confident_threshold: float = 0.60,
+) -> float:
+    """
+    Train ASJDA and return best test accuracy (%).
+    """
+    num_sources = len(source_loaders)
+    model = ASJDANet(input_dim=input_dim, number_of_source=num_sources, number_of_category=num_classes).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    source_iters = [iter(ld) for ld in source_loaders]
+    tgt_iter = iter(target_train_loader)
+
+    total_iters = max(1, epochs * len(target_train_loader))
+
+    best_correct = -1
+    best_total = 1
+    best_state = None
+
+    for it in range(1, total_iters + 1):
+        model.train()
+
+        alpha = 2.0 / (1.0 + math.exp(-10.0 * it / total_iters)) - 1.0
+        beta = alpha / 100.0
+        gamma = alpha - 1.0
+
+        for j in range(num_sources):
+            try:
+                src_x, src_y = next(source_iters[j])
+            except Exception:
+                source_iters[j] = iter(source_loaders[j])
+                src_x, src_y = next(source_iters[j])
+
+            try:
+                tgt_x, _ = next(tgt_iter)
+            except Exception:
+                tgt_iter = iter(target_train_loader)
+                tgt_x, _ = next(tgt_iter)
+
+            src_x = src_x.to(device, non_blocking=True)
+            src_y = src_y.to(device, non_blocking=True)
+            tgt_x = tgt_x.to(device, non_blocking=True)
+
+            # ensure same batch size for mmd_linear
+            b = min(src_x.size(0), tgt_x.size(0))
+            if b < 2:
+                continue
+            src_x = src_x[:b]
+            src_y = src_y[:b]
+            tgt_x = tgt_x[:b]
+
+            optimizer.zero_grad(set_to_none=True)
+
+            cls_loss, mmd_loss_val, disc_loss_val, lsd_loss_val = model(
+                src_x,
+                number_of_source=num_sources,
+                data_tgt=tgt_x,
+                label_src=src_y,
+                mark=j,
+                num_class_for_lsd=num_classes,
+                confident_threshold=confident_threshold,
+            )
+
+            loss = cls_loss + alpha * mmd_loss_val + beta * disc_loss_val + gamma * lsd_loss_val
+            loss.backward()
+            optimizer.step()
+
+        if (it % max(1, log_interval)) == 0:
+            print(f"  iter {it}/{total_iters} alpha={alpha:.3f} loss={float(loss.detach().cpu()):.4f}")
+
+        if (it % max(1, eval_interval)) == 0 or it == total_iters:
+            correct, total = evaluate(model, target_test_loader, num_sources=num_sources, device=device)
+            acc = 100.0 * correct / max(1, total)
+            print(f"  [eval @iter {it}] test_acc={acc:.2f}% ({correct}/{total})")
+            if correct > best_correct:
+                best_correct, best_total = correct, total
+                best_state = copy.deepcopy(model.state_dict())
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    best_acc = 100.0 * best_correct / max(1, best_total)
+    return best_acc
+
+
+# -------------------------
+# Main pipeline
+# -------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser("ASJDA on (N,T,C) EEG mat files")
+    p.add_argument(
+        "--data_path",
+        type=str,
+        help="Folder containing per-subject .mat files"
+    )
+
+    p.add_argument("--gpu", type=str, default="0", help="CUDA_VISIBLE_DEVICES, e.g. '0'. Ignored if no CUDA.")
+    p.add_argument("--seed", type=int, default=20)
+
+    # mat keys
+    p.add_argument("--mat_key_train", type=str, default="X_train")
+    p.add_argument("--mat_key_test", type=str, default="X_test")
+    p.add_argument("--mat_key_y_train", type=str, default="y_train")
+    p.add_argument("--mat_key_y_test", type=str, default="y_test")
+    p.add_argument("--expected_C", type=int, default=62)
+    p.add_argument("--replace_neg1_with_0", action="store_true", default=True)
+
+    # feature extraction
+    p.add_argument("--sampling_rate", type=int, default=200)
+    p.add_argument("--bands", type=str, default="1-4,4-8,8-14,14-31,31-50",
+                   help="Comma-separated bands like '1-4,4-8,8-14,14-31,31-50'")
+    p.add_argument("--welch_nperseg", type=int, default=200)
+    p.add_argument("--relative_power", action="store_true", default=False, help="Use relative bandpower")
+    p.add_argument("--de_like", action="store_true", default=True, help="Use DE-like transform; else log(power)")
+    p.add_argument("--cache_dir", type=str, default="", help="If set, cache extracted features here to speed reruns")
+    p.add_argument("--verbose_fe", action="store_true", default=False)
+
+    # source selection
+    p.add_argument("--source_select", type=str, default="topk", choices=["all", "topk", "threshold"])
+    p.add_argument("--top_k", type=int, default=7, help="Used when source_select=topk or threshold fallback")
+    p.add_argument("--js_threshold", type=float, default=0.005, help="Used when source_select=threshold")
+
+    # training
+    p.add_argument("--batch_size", type=int, default=96)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--eval_interval", type=int, default=500)
+    p.add_argument("--log_interval", type=int, default=50)
+    p.add_argument("--confident_threshold", type=float, default=0.60)
+
+    # dataloader
+    p.add_argument("--num_workers", type=int, default=0)
+    return p.parse_args()
+
+
+def parse_bands(bands_str: str) -> List[Tuple[float, float]]:
+    bands = []
+    parts = [x.strip() for x in bands_str.split(",") if x.strip()]
+    for part in parts:
+        lo_hi = part.split("-")
+        if len(lo_hi) != 2:
+            raise ValueError(f"Bad band spec: {part}")
+        lo = float(lo_hi[0])
+        hi = float(lo_hi[1])
+        if hi <= lo:
+            raise ValueError(f"Band high must be > low: {part}")
+        bands.append((lo, hi))
+    return bands
+
+
+def maybe_cache_load(cache_path: str) -> Optional[Dict[str, np.ndarray]]:
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            return {k: data[k] for k in data.files}
+        except Exception:
+            return None
+    return None
+
+
+def cache_save(cache_path: str, **arrays):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(cache_path, **arrays)
+
+
+def main():
+    args = parse_args()
+    setup_seed(args.seed)
+    device = get_device(args.gpu)
+    print("Device:", device)
+
+    bands = parse_bands(args.bands)
+    C = args.expected_C
+    input_dim = C * len(bands)
+
+    # load all subjects
+    files = sorted([f for f in os.listdir(args.data_path) if f.endswith(".mat")])
+    if len(files) < 2:
+        raise RuntimeError(f"Need at least 2 subject files in {args.data_path}")
+
+    subjects: List[Dict[str, np.ndarray]] = []
+    for k, fname in enumerate(files):
+        fp = os.path.join(args.data_path, fname)
+        Xtr, ytr, Xte, yte = load_subject_mat(
+            fp,
+            key_X_train=args.mat_key_train,
+            key_X_test=args.mat_key_test,
+            key_y_train=args.mat_key_y_train,
+            key_y_test=args.mat_key_y_test,
+            expected_C=C,
+            replace_neg1_with_0=args.replace_neg1_with_0,
+        )
+        subjects.append({"name": fname, "X": Xte, "y": yte})
+
+    subjects, mapping = remap_labels_all_subjects(subjects)
+    num_classes = len(mapping)
+    print("Label mapping:", mapping)
+    print("Num classes:", num_classes)
+    print(f"Feature dim will be {input_dim} (= {C} * {len(bands)} bands)")
+
+    feats_all = []
+    for k, sub in enumerate(subjects):
+        X_feat_raw = extract_features_NTC(sub["X"], fs=args.sampling_rate, bands=bands, nperseg=args.welch_nperseg,
+            relative=args.relative_power, de_like=args.de_like,
+            expected_C=C, verbose=args.verbose_fe)
+        mn, rng = minmax_fit(X_feat_raw)
+        X_feat = minmax_transform(X_feat_raw, mn, rng).astype(np.float32)
+        feats_all.append(X_feat)
+
+    # main LOSO evaluation (target subject = k)
+    accs = []
+    for target_k in range(len(subjects)):
+        target_name = subjects[target_k]["name"]
+        print("\n" + "=" * 80)
+        print(f"Target subject {target_k}: {target_name}")
+
+        X_tgt = feats_all[target_k]
+        y_tgt = subjects[target_k]["y"]
+
+        # 训练时把 y 忽略掉（loader 仍要返回 y，但模型训练不会用 target 的标签）
+        X_tgt_train = X_tgt
+        y_tgt_train = y_tgt
+
+        # 评估用同一批数据的标签（transductive setting）
+        X_tgt_test = X_tgt
+        y_tgt_test = y_tgt
+
+        # candidate sources = all others, use their TRAIN sets
+        candidates = [i for i in range(len(subjects)) if i != target_k]
+
+        # compute JS divergence using minmax-scaled TRAIN features
+        js_scores: Dict[int, float] = {}
+        for s in candidates:
+            js_scores[s] = js_divergence_between_domains(feats_all[s], X_tgt)
+
+        selected_sources = select_source_subjects(
+            js_scores=js_scores,
+            mode=args.source_select,
+            top_k=args.top_k,
+            threshold=args.js_threshold,
+        )
+        print("Selected sources:", selected_sources)
+        print("JS scores (selected):", {k: js_scores[k] for k in selected_sources})
+
+        # Build loaders
+        # Choose batch size that is safe for ALL selected sources and target train
+        min_len = min([len(subjects[s]["y"]) for s in selected_sources] + [len(y_tgt_train)])
+        bs = min(args.batch_size, int(min_len))
+        if bs < 2:
+            raise RuntimeError(f"Batch size would be <2 (min_len={min_len}). Increase data or reduce constraints.")
+
+        source_loaders = []
+        for s in selected_sources:
+            source_loaders.append(
+                make_loader(
+                    feats_all[s], subjects[s]["y"],
+                    batch_size=bs, shuffle=True, drop_last=True, num_workers=args.num_workers
+                )
+            )
+
+        target_train_loader = make_loader(
+            X_tgt_train, y_tgt_train,
+            batch_size=bs, shuffle=True, drop_last=True, num_workers=args.num_workers
+        )
+
+        target_test_loader = make_loader(
+            X_tgt_test, y_tgt_test,
+            batch_size=32, shuffle=False, drop_last=False, num_workers=args.num_workers
+        )
+
+        # Train + test
+        acc = train_asjda_for_target(
+            source_loaders=source_loaders,
+            target_train_loader=target_train_loader,
+            target_test_loader=target_test_loader,
+            input_dim=input_dim,
+            num_classes=num_classes,
+            device=device,
+            epochs=args.epochs,
+            lr=args.lr,
+            eval_interval=args.eval_interval,
+            log_interval=args.log_interval,
+            confident_threshold=args.confident_threshold,
+        )
+        accs.append(acc)
+        print(f"[Result] Target {target_k} acc = {acc:.2f}%")
+
+    print("\n" + "=" * 80)
+    print("All subject accs:", [round(a, 2) for a in accs])
+    print(f"Mean acc: {np.mean(accs):.2f}%  Std: {np.std(accs):.2f}%")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
