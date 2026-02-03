@@ -64,11 +64,17 @@ Key steps:
 The repository also includes minimal PyTorch implementations of the **baseline methods** used for comparison with STSLR-rDA.  
 Each implementation is adapted/simplified from the authors’ original public code:
 
+- **ASJDA (Adaptive Source Joint Domain Adaptation)** – A multi-source domain adaptation framework for cross-subject EEG emotion recognition. ASJDA first adaptively selects source domains that are most similar to the target (based on divergence measures), and then performs joint domain adaptation at both the global domain and class-wise subdomain levels to improve cross-subject generalization.  
+  Original implementation: [https://github.com/Pam098/ASJDA](https://github.com/Pam098/ASJDA)
+
 - **DAN** – Deep Adaptation Network with MMD-based domain alignment  
   Original implementation: [https://github.com/MaterialsInformaticsDemo/DAN](https://github.com/MaterialsInformaticsDemo/DAN)
 
 - **DGCNN** – Dynamic Graph Convolutional Neural Network operating on EEG time series  
   Original implementation: [https://github.com/zzx-JLU/DGCNN](https://github.com/zzx-JLU/DGCNN)
+
+  - **EmT (Emotion Transformer)** – A graph-transformer architecture for generalized cross-subject EEG emotion recognition. EmT represents EEG segments as temporal graphs, uses a residual multi-view pyramid GCN module to learn dynamic graph representations, and a temporal contextual transformer (TCT) to capture long-range temporal dependencies across feature graphs.  
+  Original implementation: [https://github.com/yi-ding-cs/EmT](https://github.com/yi-ding-cs/EmT)
 
 - **UDDA** – Unsupervised domain adaptation method for EEG-based emotion recognition, combining global and local distribution alignment  
   Original implementation: [https://github.com/JCJournal-Club/DDA](https://github.com/JCJournal-Club/DDA)
@@ -83,8 +89,10 @@ These baselines are organized under:
 
 ```text
 baselines/
+  ASJDA.py
   DAN.py
   DGCNN.py
+  EmT.py
   UDDA.py
   GRU-MCC.py
   SBLECA.py
